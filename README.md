@@ -2,6 +2,8 @@
 ------------------------------------------
 This repository is a PicusApp that performs simple CRUD operations in AWS DynamoDB using dotnet 8.0.  Also contains the CI/CD pipeline configuration for the PicusApp project. The pipeline automates the build, test, and deployment processes, ensuring seamless application delivery.
 
+The application is deployed to AWS EC2 with the help of pipeline.
+
 *******************************************
 AWS Resources
 - IAM
