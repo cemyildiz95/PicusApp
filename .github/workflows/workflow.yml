@@ -1,0 +1,156 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git Clone
+        uses: actions/checkout@v3
+  
+
+      - name: Update appsettings.json with Secrets
+        run: |
+          jq '.AWS.AccessKey = env.AWS_DYNAMO_DB_ACCESS_KEY_ID |
+              .AWS.SecretKey = env.AWS_SECRET_DYNAMO_DB_ACCESS_KEY |
+              .AWS.Region = env.AWS_REGION |
+              .AWS.TableName = env.AWS_TABLE_NAME' appsettings.json > appsettings.updated.json
+          mv appsettings.updated.json appsettings.json
+
+        env:
+          AWS_DYNAMO_DB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMO_DB_ACCESS_KEY_ID }}
+          AWS_SECRET_DYNAMO_DB_ACCESS_KEY: ${{ secrets.AWS_SECRET_DYNAMO_DB_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_TABLE_NAME: ${{ secrets.AWS_TABLE_NAME }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+          
+      - name: Create Docker Image
+        run: |
+          docker build -t picusapp .
+          docker tag picusapp:latest ${{ secrets.AWS_ECR_URI }}:ec2
+          docker tag picusapp:latest ${{ secrets.AWS_ECR_URI }}:ecs
+          
+      - name: Push To ECR
+        run: |
+          aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin 054037109571.dkr.ecr.eu-west-1.amazonaws.com
+          docker push ${{ secrets.AWS_ECR_URI }}:ec2
+          docker push ${{ secrets.AWS_ECR_URI }}:ecs
+                
+
+
+  CreateRollbackImage:
+    runs-on: ubuntu-latest
+    needs: [Build]
+    steps:
+      - name: Run Rollback Image
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          port: 22
+          script: |
+            docker run -d -p 8081:8080 --name picusapp-rb ${{ secrets.AWS_ECR_URI }}:ec2
+  
+  
+  ReplaceLBTargetGroupTo8081:
+    runs-on: ubuntu-latest
+    needs: [CreateRollbackImage]
+    steps:
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+          
+      - name: Replace ALB Target Group
+        run: |
+            aws elbv2 modify-listener \
+                --listener-arn ${{ secrets.ELASTIC_LOADBALANCER_LISTENER_ARN }} \
+                --default-actions Type=forward,TargetGroupArn=${{ secrets.ELASTIC_LOADBALANCER_TARGET_GROUP_ARN_8081 }}
+
+
+  Deploy:
+    runs-on: ubuntu-latest
+    needs: [ReplaceLBTargetGroupTo8081]
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          port: 22
+          script: |
+            sudo apt install awscli -y
+            aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin 054037109571.dkr.ecr.eu-west-1.amazonaws.com
+            docker pull ${{ secrets.AWS_ECR_URI }}:ec2
+            docker stop picusapp || true
+            docker rm picusapp || true
+            docker run -d -p 8080:8080 --name picusapp ${{ secrets.AWS_ECR_URI }}:ec2
+
+            #Health Check
+            HEALTH_URL="http://localhost:8080/picus/health"
+            echo "Checking health of the application at $HEALTH_URL..."
+            for i in {1..3}; do
+              # Response Code
+              response=$(curl -s -w "%{http_code}" -o response_body.txt $HEALTH_URL)
+              status=$(grep -o '"status":"[^"]*"' response_body.txt | sed 's/"status":"//;s/"//')
+
+              if [ "$status" == "Healthy" ] && [ "$response" -eq 200 ]; then
+                echo "Health check passed! Status: $status, HTTP Response: $response"
+                exit 0
+              else
+                echo "Health check failed. Status: $status, HTTP Response: $response. Retrying in 3 seconds..."
+                sleep 3
+              fi
+            done
+            echo "Health check failed after 10 attempts."
+            exit 1  
+  
+  ReplaceLBTargetGroupTo8080:
+    runs-on: ubuntu-latest
+    needs: [Deploy]
+    steps:
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+          
+      - name: Replace ALB Target Group
+        run: |
+            aws elbv2 modify-listener \
+                --listener-arn ${{ secrets.ELASTIC_LOADBALANCER_LISTENER_ARN }} \
+                --default-actions Type=forward,TargetGroupArn=${{ secrets.ELASTIC_LOADBALANCER_TARGET_GROUP_ARN_8080 }}
+                
+
+
+  DeleteRollbackImage:
+    runs-on: ubuntu-latest
+    needs: [ReplaceLBTargetGroupTo8080]
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_KEY }}
+          port: 22
+          script: |
+                docker stop picusapp-rb || true
+                docker rm picusapp-rb || true
